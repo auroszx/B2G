@@ -1,6 +1,6 @@
 .config
 .repo/
-.userconfig
+.userconfig*
 .var.profile
 *.swp
 *.pyc
@@ -11,12 +11,12 @@ abi/
 backup-*/
 bionic/
 bootable/
+brcm_usrlib/
 build/
 dalvik/
 development/
 device/
-download-galaxy-nexus/
-download-nexus-s/
+download-*/
 external/
 frameworks/
 gaia/
@@ -25,6 +25,7 @@ gonk-misc/
 hardware/
 kernel/
 libcore/
+libnativehelper/
 librecovery/
 ndk/
 objdir-gecko*/
@@ -35,3 +36,4 @@ rilproxy/
 sdk/
 system/
 vendor/
+b2g_sdk/

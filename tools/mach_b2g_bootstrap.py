@@ -1,0 +1,312 @@
+# This Source Code Form is subject to the terms of the Mozilla Public
+# License, v. 2.0. If a copy of the MPL was not distributed with this
+# file, You can obtain one at http://mozilla.org/MPL/2.0/.
+
+from __future__ import print_function, unicode_literals
+
+import imp
+import os
+import pickle
+import platform
+import subprocess
+import sys
+import tempfile
+import time
+import urlparse
+
+STATE_DIR_FIRST_RUN = '''
+mach and the build system store shared state in a common directory on the
+filesystem. The following directory will be created:
+
+  {userdir}
+
+If you would like to use a different directory, hit CTRL+c and set the
+MOZBUILD_STATE_PATH environment variable to the directory you would like to
+use and re-run mach. For this change to take effect forever, you'll likely
+want to export this environment variable from your shell's init scripts.
+'''.lstrip()
+
+MACH_NOT_FOUND = '''
+The mach module could not be found on your system. Either configure the B2G
+repo, so the copy in gecko can be used, or install it from the Python package
+index.
+
+To install mach from pypi, run:
+
+    $ wget https://raw.github.com/pypa/pip/master/contrib/get-pip.py -O - | python
+    $ pip install mach
+'''.lstrip()
+
+MACH_DUPLICATES = '''
+Warning: two copies of mach were detected. Using the copy in '%s'. To remove
+the obsolete copy in '%s', run `pip uninstall mach`.
+'''.lstrip()
+
+LOAD_CONFIG_FAILED = '''
+An error occured when trying to source load-config.sh. Make sure there are
+no problems with your .userconfig file and try again. The following output was
+received:
+
+%s
+
+If you think this is an error in the mach driver itself, please file a bug under
+Boot2Gecko/Builds.
+'''.lstrip()
+
+# TODO Bug 794506 Integrate with the in-tree virtualenv configuration.
+SEARCH_PATHS = []
+
+# Individual files providing mach commands.
+MACH_MODULES = [
+    'python/mach/mach/commands/commandinfo.py',
+]
+
+CATEGORIES = {
+    'build': {
+        'short': 'Build Commands',
+        'long': 'Interact with the build system',
+        'priority': 80,
+    },
+    'post-build': {
+        'short': 'Post-build Commands',
+        'long': 'Common actions performed after completing a build.',
+        'priority': 70,
+    },
+    'testing': {
+        'short': 'Testing',
+        'long': 'Run tests.',
+        'priority': 60,
+    },
+    'ci': {
+        'short': 'CI',
+        'long': 'Taskcluster commands',
+        'priority': 59
+    },
+    'devenv': {
+        'short': 'Development Environment',
+        'long': 'Set up and configure your development environment.',
+        'priority': 50,
+    },
+    'build-dev': {
+        'short': 'Low-level Build System Interaction',
+        'long': 'Interact with specific parts of the build system.',
+        'priority': 20,
+    },
+    'misc': {
+        'short': 'Potpourri',
+        'long': 'Potent potables and assorted snacks.',
+        'priority': 10,
+    },
+    'disabled': {
+        'short': 'Disabled',
+        'long': 'These commands are unavailable for your current context, run "mach <command>" to see why.',
+        'priority': 0,
+    }
+}
+
+def download_b2g_sdk(b2g_sdk):
+    system = platform.system()
+    if system == "Linux":
+        url = "https://queue.taskcluster.net/v1/task/YamDhuDgTWa_kWXcSedDHA/artifacts/public/build/target.linux-x86_64.tar.bz2"
+    elif system == "Darwin":
+        url = "http://ftp.mozilla.org/pub/mozilla.org/b2g/nightly/2015/09/2015-09-02-03-02-03-mozilla-central/b2g-43.0a1.en-US.mac64.dmg"
+    elif system == "Windows":
+        url = "http://ftp.mozilla.org/pub/mozilla.org/b2g/nightly/2015/09/2015-09-02-03-02-03-mozilla-central/b2g-43.0a1.en-US.win32.zip"
+    else:
+        raise Exception('Unable to download b2g_sdk for %s' % system)
+
+    if not os.path.isdir(b2g_sdk):
+        os.mkdir(b2g_sdk)
+
+    b2g_path = os.path.join(b2g_sdk, "b2g")
+    if not os.path.isdir(b2g_path):
+        file_path = os.path.join(b2g_sdk, os.path.basename(urlparse.urlparse(url).path))
+
+        import requests
+
+        with open(file_path, "wb") as b2g:
+            print("Downloading %s" % url)
+            response = requests.get(url, stream=True)
+            total_length = response.headers.get("content-length")
+
+            if total_length is None: # no content length header
+                b2g.write(response.content)
+            else:
+                download_length = 0
+                total_length = int(total_length)
+                for data in response.iter_content(8192):
+                    download_length += len(data)
+                    b2g.write(data)
+                    print("\r%10d / %10d [%3.2f%%]" %
+                            (download_length,
+                            total_length,
+                            download_length * 100. / total_length),
+                            end = "")
+            b2g.close()
+
+        print()
+        print("Extract %s..." % file_path)
+
+        import mozinstall
+        mozinstall.install(file_path, os.path.join(b2g_sdk))
+
+        if system == "Darwin":
+            os.symlink(os.path.join(b2g_sdk, "B2G.app", "Contents", "MacOS"), b2g_path)
+
+    return b2g_path
+
+def bootstrap(b2g_home):
+    # Ensure we are running Python 2.7+. We put this check here so we generate a
+    # user-friendly error message rather than a cryptic stack trace on module
+    # import.
+    if sys.version_info[0] != 2 or sys.version_info[1] < 7:
+        print('Python 2.7 or above (but not Python 3) is required to run mach.')
+        print('You are running Python', platform.python_version())
+        sys.exit(1)
+
+    # Global build system and mach state is stored in a central directory. By
+    # default, this is ~/.mozbuild. However, it can be defined via an
+    # environment variable. We detect first run (by lack of this directory
+    # existing) and notify the user that it will be created. The logic for
+    # creation is much simpler for the "advanced" environment variable use
+    # case. For default behavior, we educate users and give them an opportunity
+    # to react. We always exit after creating the directory because users don't
+    # like surprises.
+    state_user_dir = os.path.expanduser('~/.mozbuild')
+    state_env_dir = os.environ.get('MOZBUILD_STATE_PATH', None)
+    if state_env_dir:
+        if not os.path.exists(state_env_dir):
+            print('Creating global state directory from environment variable: %s'
+                % state_env_dir)
+            os.makedirs(state_env_dir, mode=0o770)
+            print('Please re-run mach.')
+            sys.exit(1)
+        state_dir = state_env_dir
+    else:
+        if not os.path.exists(state_user_dir):
+            print(STATE_DIR_FIRST_RUN.format(userdir=state_user_dir))
+            try:
+                for i in range(20, -1, -1):
+                    time.sleep(1)
+                    sys.stdout.write('%d ' % i)
+                    sys.stdout.flush()
+            except KeyboardInterrupt:
+                sys.exit(1)
+
+            print('\nCreating default state directory: %s' % state_user_dir)
+            os.mkdir(state_user_dir)
+            print('Please re-run mach.')
+            sys.exit(1)
+        state_dir = state_user_dir
+
+    if os.path.isfile(os.path.join(b2g_home, '.config')):
+        # Load the configuration created by the build system.
+        # We need to call set -a because load-config doesn't
+        # export the variables it creates.
+        f = tempfile.NamedTemporaryFile()
+        cmd = ['/usr/bin/env', 'bash', '-c',
+               'set -a && source %s > %s && python -c "import pickle,os;print(pickle.dumps(os.environ))"'
+                % (os.path.join(b2g_home, 'load-config.sh'), f.name)]
+        try:
+            output = subprocess.check_output(cmd, stderr=subprocess.STDOUT, cwd=b2g_home)
+            os.environ.update(pickle.loads(output))
+        except subprocess.CalledProcessError, e:
+            print(LOAD_CONFIG_FAILED % e.output.strip())
+            sys.exit(1)
+
+        output = f.read()
+        if output:
+            print(output)
+        f.close()
+
+    # Absolutize GECKO_OBJDIR here, since otherwise mach will try to
+    # absolutize it relative to the topsrcdir, which might be different
+    # if GECKO_PATH is in use.
+    if os.environ.get('GECKO_OBJDIR') is not None:
+       os.environ['GECKO_OBJDIR'] = os.path.join(b2g_home, os.environ['GECKO_OBJDIR'])
+
+    # If a gecko source tree is detected, its mach modules are also
+    # loaded.
+    gecko_dir = os.environ.get('GECKO_PATH', os.path.join(b2g_home, 'gecko'))
+    gecko_bootstrap_dir = os.path.join(gecko_dir, 'build')
+    if os.path.isdir(gecko_bootstrap_dir):
+        path = os.path.join(gecko_bootstrap_dir, 'mach_bootstrap.py')
+        with open(path, 'r') as fh:
+            imp.load_module('mach_bootstrap', fh, path,
+                ('.py', 'r', imp.PY_SOURCE))
+
+        import mach_bootstrap
+
+        global SEARCH_PATHS
+        global MACH_MODULES
+        relpath = os.path.relpath(gecko_dir)
+        SEARCH_PATHS += [os.path.join(relpath, p)
+                            for p in mach_bootstrap.SEARCH_PATHS]
+        MACH_MODULES += [os.path.join(relpath, p)
+                            for p in mach_bootstrap.MACH_MODULES]
+
+    mach_package = None
+    try:
+        mach_package = imp.find_module('mach')[1]
+    except:
+        pass
+
+    try:
+        sys.path[0:0] = [os.path.join(b2g_home, path) for path in SEARCH_PATHS]
+        import mach.main
+    except ImportError:
+        print(MACH_NOT_FOUND)
+        sys.exit(1)
+
+    mach_gecko = os.path.join(gecko_dir, 'python', 'mach')
+    if mach_package and os.path.isdir(mach_gecko):
+        print(MACH_DUPLICATES % (mach_gecko, mach_package))
+
+    # The build system doesn't provide a mechanism to use
+    # a different mozconfig.
+    os.environ['MOZCONFIG'] = os.path.join(b2g_home, 'gonk-misc',
+                                           'default-gecko-config')
+
+    xre_path = download_b2g_sdk(os.path.join(os.getcwd(), "b2g_sdk"))
+
+    def get_build_var(name):
+        env = os.environ.copy()
+        env.update({'CALLED_FROM_SETUP': 'true',
+                    'BUILD_SYSTEM': 'build/core'})
+        command = ['make', '--no-print-directory',
+                   '-C', b2g_home,
+                   '-f', 'build/core/config.mk',
+                   'dumpvar-abs-%s' % name]
+        DEVNULL = open(os.devnull, 'wb')
+        return subprocess.check_output(command, env=env, stderr=DEVNULL).strip()
+
+    def populate_context(context):
+        context.state_dir = state_dir
+        context.topdir = gecko_dir
+        context.b2g_home = b2g_home
+        context.xre_path = xre_path
+        # device name is set from load configuration step above
+        context.device_name = os.environ.get('DEVICE_NAME', '').rstrip()
+        context.device = os.environ.get('DEVICE', '').rstrip()
+        context.target_out = os.path.join(
+            get_build_var('TARGET_PRODUCT_OUT_ROOT'),
+            context.device)
+        context.get_build_var = get_build_var
+
+    mach = mach.main.Mach(b2g_home)
+    mach.populate_context_handler = populate_context
+    mach.require_conditions = True
+
+    for category, meta in CATEGORIES.items():
+        mach.define_category(category, meta['short'], meta['long'],
+            meta['priority'])
+
+    for path in MACH_MODULES:
+        module = os.path.join(b2g_home, path)
+        if os.path.isfile(module):
+            mach.load_commands_from_file(os.path.join(b2g_home, path))
+
+    if hasattr(mach, 'load_commands_from_entry_point'):
+        mach.load_commands_from_entry_point('mach.b2g.providers')
+
+    return mach

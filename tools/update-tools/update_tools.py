@@ -19,6 +19,7 @@ from cStringIO import StringIO
 import datetime
 import hashlib
 import os
+import glob
 import platform
 import re
 import shutil
@@ -42,6 +43,9 @@ def validate_env(parser):
 
     if sys.version_info < (2, 7):
         parser.error("This tool requires Python 2.7 or greater")
+
+    if not which("arm-linux-androideabi-readelf", path=os.environ.get("ANDROID_TOOLCHAIN")):
+        parser.error("No readelf binary in ANDROID_TOOLCHAIN")
 
 def run_command(*args, **kwargs):
     try:
@@ -353,7 +357,7 @@ class FotaZip(zipfile.ZipFile):
     CERT_SF        = "META-INF/CERT.SF"
 
     def __init__(self, path, mode="r", compression=zipfile.ZIP_DEFLATED):
-        zipfile.ZipFile.__init__(self, path, mode, compression)
+        zipfile.ZipFile.__init__(self, path, mode, compression, True)
 
     def has_entry(self, entry):
         try:
@@ -373,9 +377,8 @@ class FotaZip(zipfile.ZipFile):
     def write_updater_script(self, script):
         self.writestr(self.UPDATER_SCRIPT, script)
 
-    def write_default_update_binary(self):
-        prebuilt_update_binary = os.path.join(bin_dir, "gonk", "update-binary")
-        self.write(prebuilt_update_binary, self.UPDATE_BINARY)
+    def write_default_update_binary(self, update_bin):
+        self.write(update_bin, self.UPDATE_BINARY)
 
     def write_recursive(self, path, zip_path=None, filter=None):
         def zip_relpath(file_path):
@@ -392,17 +395,8 @@ class FotaZip(zipfile.ZipFile):
                 if not filter or filter(file_path, relpath):
                     self.write(file_path, relpath)
 
-            if not filter:
-                continue
-
-            for d in dirs:
-                dir_path = os.path.join(root, d)
-                relpath = zip_relpath(dir_path)
-                if not filter(dir_path, relpath):
-                    dirs.remove(d)
-
 class FotaZipBuilder(object):
-    def build_unsigned_zip(self, update_dir, output_zip):
+    def build_unsigned_zip(self, update_dir, output_zip, update_bin):
         if not os.path.exists(update_dir):
             raise UpdateException("Update dir doesn't exist: %s" % update_dir)
 
@@ -415,7 +409,7 @@ class FotaZipBuilder(object):
 
         if not os.path.exists(update_binary):
             print "Warning: update-binary not found, using default"
-            update_zipfile.write_default_update_binary()
+            update_zipfile.write_default_update_binary(update_bin)
 
         update_zipfile.write_recursive(update_dir)
         update_zipfile.close()
@@ -478,12 +472,12 @@ class GeckoMarBuilder(object):
         self.make_full_update = os.path.join(packaging_dir,
             "make_full_update.sh")
         if not os.path.exists(self.make_full_update):
-            raise UpdateException("Couldn't find %s " % make_full_update)
+            raise UpdateException("Couldn't find %s " % self.make_full_update)
 
         self.make_incremental_update = os.path.join(packaging_dir,
             "make_incremental_update.sh")
         if not os.path.exists(self.make_incremental_update):
-            raise UpdateException("Couldn't find %s " % make_incremental_update)
+            raise UpdateException("Couldn't find %s " % self.make_incremental_update)
 
     def build_gecko_mar(self, src_dir, output_mar, from_dir=None):
         if from_dir:
@@ -825,14 +819,368 @@ class Partition(object):
     def create_data(cls, fs_type, device):
         return Partition(fs_type, "/data", device)
 
+"""
+   Copied and adapted from AOSP (build/tools/releasetools/common.py)
+    - fstab_version 1 is:
+mountpoint device fs mountoptions
+    - fstab_version 2 is:
+device mountpoint fs mountflags fsoptions
+"""
+class RecoveryFSTab:
+
+    def __init__(self, file):
+        self._content = []
+        self._version = 0
+
+        with open(file, 'r') as f:
+            self._content = f.readlines()
+
+        for line in self._content:
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            pieces = line.split()
+
+            # fstab_version 1
+            if 3 <= len(pieces) <= 4:
+                self._version = 1
+
+            # fstab_version 2
+            if len(pieces) == 5:
+                self._version = 2
+
+    def read_v1(self):
+        d = {}
+        for line in self._content:
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            pieces = line.split()
+            if not (3 <= len(pieces) <= 4):
+                raise ValueError("malformed recovery.fstab line: \"%s\"" % (line,))
+            p = Partition(pieces[1], pieces[0], pieces[2])
+            p.length = 0
+            options = None
+            if len(pieces) >= 4:
+                if pieces[3].startswith("/"):
+                    p.device2 = pieces[3]
+                    if len(pieces) >= 5:
+                        options = pieces[4]
+                else:
+                    p.device2 = None
+                    options = pieces[3]
+            else:
+                p.device2 = None
+            if options:
+                options = options.split(",")
+                for i in options:
+                    if i.startswith("length="):
+                        p.length = int(i[7:])
+                    else:
+                        print "%s: unknown option \"%s\"" % (p.mount_point, i)
+            d[p.mount_point] = p
+        return d
+
+    def read_v2(self):
+        d = {}
+        for line in self._content:
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            pieces = line.split()
+            if len(pieces) != 5:
+                raise ValueError("malformed recovery.fstab line: \"%s\"" % (line,))
+            # Ignore entries that are managed by vold
+            options = pieces[4]
+            if "voldmanaged=" in options:
+                continue
+            # It's a good line, parse it
+            p = Partition(pieces[2], pieces[1], pieces[0])
+            p.device2 = None
+            p.length = 0
+            options = options.split(",")
+            for i in options:
+                if i.startswith("length="):
+                    p.length = int(i[7:])
+                else:
+                    # Ignore all unknown options in the unified fstab
+                    continue
+            d[p.mount_point] = p
+        return d
+
+    def read(self):
+        if self._version == 1:
+            return self.read_v1()
+
+        if self._version == 2:
+            return self.read_v2()
+
 class FlashFotaBuilder(object):
-    def __init__(self, system, data):
-        self.fstab = { "/system": system, "/data": data }
+    def __init__(self, fstab, sdk):
+        self.fstab = RecoveryFSTab(fstab).read()
+        self.sdk_version = sdk
         self.symlinks = []
+        self.info_dict = {"fstab": self.fstab}
+
+        self.fota_check_fingerprints = []
+        if os.environ.get("FOTA_FINGERPRINTS"):
+            self.fota_check_fingerprints = os.environ.get("FOTA_FINGERPRINTS").split(',')
 
         if "Item" not in globals():
             self.import_releasetools()
-        self.generator = edify_generator.EdifyGenerator(1, {"fstab": self.fstab})
+            if self.sdk_version >= 21:
+                self.itemset = ItemSet("system", "META/filesystem_config.txt")
+        # Bug 1163956, enable set_metadata() and set_metadata_recursive() in updater-script
+        # export in BoardConfig.mk or per-device.mk
+        if bool(os.environ.get('USE_SET_METADATA', False)) == True:
+            self.info_dict['use_set_metadata'] = True
+        self.generator = edify_generator.EdifyGenerator(1, self.info_dict)
+
+    def GetFilesType(self, directory):
+        """
+        Compute file mime type for a directory
+        """
+        cmd = ['file', '--mime-type' ] + glob.glob(os.path.join(directory, '*'))
+        result = subprocess.check_output(cmd).split('\n')
+        return result
+
+    def AssertMountIfNeeded(self, mount_point):
+        """
+           AssertMount the partition with the given mount_point
+           if it is not already mounted.
+        """
+        fstab = self.generator.info.get("fstab", None)
+        if fstab:
+            p = fstab[mount_point]
+            self.generator.Print("Mounting " + mount_point)
+            self.generator.script.append(
+               'ifelse(is_mounted("%s"),' \
+               'ui_print("Already mounted."),' \
+               'assert(mount("%s", "%s", "%s", "%s")));' %
+                (p.mount_point,
+                 p.fs_type, common.PARTITION_TYPES[p.fs_type],
+                 p.device, p.mount_point))
+            self.generator.mounts.add(p.mount_point)
+
+    def AssertSystemHasRwAccess(self):
+        """
+           Assert that /system is mounted in rw mode
+        """
+        self.generator.Print("Checking /system is writable")
+        self.generator.script.append('assert(run_program("/system/bin/touch", "/system/bin/") == 0);')
+        self.generator.Print("Partition is writable, we can continue")
+
+    def GetDependencies(self, path):
+        """
+           Find dependencies from readelf output
+        """
+        so_re = re.compile(r".*\[(.*)\.so\]")
+        readelf_android = "arm-linux-androideabi-readelf"
+        readelf_path = os.path.join(os.environ.get("ANDROID_TOOLCHAIN"), readelf_android)
+        result = run_command([readelf_path, "-d", path])
+        dependencies = []
+        for line in result.splitlines():
+            if line.find("(NEEDED)") > 0:
+                match = so_re.match(line)
+                if match and not (match.group(1) + ".so" in self.b2g_libs):
+                    # print "Adding dep against", match.group(1), "for", path
+                    dependencies.append(match.group(1) + ".so")
+        return dependencies
+
+    def GetSha1Values(self):
+        """
+           Build a list of file/sha1 values
+        """
+        b2g_bins = self.b2g_libs + self.b2g_exec
+        b2g_exec_files = map(lambda x: os.path.join(self.out_b2g_dir, x), b2g_bins)
+
+        deps_list = []
+        for p in b2g_exec_files:
+            deps_list = list(set(deps_list + self.GetDependencies(p)))
+
+        sha1_list = []
+        for root, dirs, files in os.walk(self.system_dir):
+            for file in files:
+                if file in deps_list:
+                    fpath = os.path.join(root, file)
+                    rpath = fpath.replace(self.system_dir, "/system")
+                    with open(fpath, 'r') as lib:
+                        hasher = hashlib.sha1()
+                        hasher.update(lib.read())
+                        sha1_list.append({
+                            'file': rpath,
+                            'sha1': hasher.hexdigest()
+                        })
+        return sha1_list
+
+    def AssertGonkVersion(self):
+        """
+           Assert that the gonk libs sha1 hashes are okay
+        """
+        self.generator.Print("Checking Gonk version")
+        for e in self.GetSha1Values():
+            self.generator.Print("Checking %s" % (e['file'],))
+            self.generator.script.append(('assert(sha1_check(read_file("%s"), "%s"));') % (e['file'], e['sha1'],))
+        self.generator.Print("Gonk version is okay")
+
+    def AssertFingerprints(self):
+        """
+           Assert that one of the fingerprints matches
+        """
+        self.generator.Print("Checking build fingerprints")
+        self.generator.AssertSomeFingerprint(*self.fota_check_fingerprints)
+        self.generator.Print("Build is expected")
+
+    def AssertDeviceOrModel(self, device):
+        """
+           Assert that the device identifier is the given string.
+        """
+        self.generator.Print("Checking device")
+        cmd = ('assert('
+               'getprop("ro.build.product") == "%s" || '
+               'getprop("ro.product.device") == "%s" || '
+               'getprop("ro.product.model") == "%s"'
+               ');' % (device, device, device))
+        self.generator.script.append(cmd)
+        self.generator.Print("Device is compatible")
+
+    def CleanUpdateFiles(self):
+        """
+        Cleaning all the temporary files used for update
+        """
+
+        # delete_recursive() function in edify can handle files and
+        # directories.
+        staleUpdateFiles = [
+          os.path.join("/data", "local", "b2g-updates"),
+          os.path.join(self.fota_sdcard, "updates", "fota")
+        ]
+
+        # sdcard will already be mounted anyway
+        self.AssertMountIfNeeded("/data")
+
+        self.generator.Print("Cleaning FOTA files")
+        self.generator.DeleteFilesRecursive(staleUpdateFiles)
+
+        self.generator.Print("FOTA cleanup finished")
+
+    def CleanDeviceFiles(self):
+        """
+        Devices might need some cleanup after installation ...
+        """
+
+        # Device-specific files that we need to cleanup
+        # Should be specified as a space-separated list of files in
+        # the env variable FOTA_DEVICE_DATA_FILES
+        if not os.environ.has_key("FOTA_DEVICE_DATA_FILES"):
+            return
+
+        files = os.environ.get("FOTA_DEVICE_DATA_FILES")
+        if len(files) < 1:
+            return
+
+        deviceCleanup = filter(lambda x: len(x) > 0, files.split(" "))
+
+        # sdcard will already be mounted anyway
+        self.AssertMountIfNeeded("/data")
+        self.generator.Print("Cleaning device specific files")
+        self.generator.DeleteFiles(deviceCleanup)
+        self.generator.Print("Device specific cleanup finished")
+
+    def Umount(self, mount_point):
+        """
+           Unmounting a mount point. We cannot do it against a device directly.
+        """
+        self.generator.Print("Unmounting %s" % (mount_point))
+        self.generator.script.append(('unmount("%s");' % (mount_point)))
+
+    def GetPartition(self, mount_point):
+        """
+           Return a partition object from a mount point
+        """
+
+        return self.fstab[mount_point]
+
+    def Format(self, mount_point):
+        """
+           Formatting a specific partition mounted at mount_point
+
+           Edify wrapper to add format() statements.
+
+           Per bug 1047350 and bug 1008239:
+           Signature of the format() function available in Edify depends on
+           the implementation that gets pulled as update-binary and pushed
+           inside the zip file. Starting with AOSP SDK 16 (JB 4.1), it takes
+           an extra mount_point argument. The rationale here is:
+            - detect the SDK version at build time, and use the proper version
+            - update-binary that is embedded MUST be one built from source or
+              in sync with the source version. Using the prebuilt one from
+              tools/update-tools/bin/gonk/ is not a good idea.
+        """
+
+        format_statement = None
+        if self.sdk_version < 16:
+            format_statement = \
+                'format("%(fs_type)s", "%(partition_type)s", ' \
+                       '"%(device)s", %(size)d);'
+        else:
+            format_statement = \
+                'format("%(fs_type)s", "%(partition_type)s", ' \
+                       '"%(device)s", %(size)d, "%(mount_point)s");'
+
+        partition = self.GetPartition(mount_point)
+
+        # File system not in this will not be able to be formatted, e.g., vfat
+        if partition.fs_type not in common.PARTITION_TYPES.keys():
+            return
+
+        parameters = {
+            'fs_type': partition.fs_type,
+            'partition_type': common.PARTITION_TYPES[partition.fs_type],
+            'device': partition.device,
+            'size': partition.fs_size,
+            'mount_point': mount_point
+        }
+
+        self.generator.Print("Formatting partition %(mount_point)s, device %(device)s, as %(fs_type)s" % parameters)
+        self.Umount(mount_point)
+        self.generator.AppendExtra(format_statement % parameters)
+
+    def FormatAll(self):
+        """
+           Formatting all partitions
+        """
+
+        didFormat = False
+
+        for mount_point, partition in self.fstab.iteritems():
+            # We should only format what is asked for
+            if not mount_point in self.fota_format_partitions:
+                continue
+
+            self.Format(mount_point)
+            didFormat = True
+
+        if didFormat:
+            self.generator.Print("All partitions formatted.")
+
+    def FlashPartition(self, mount_point, file):
+        partition = self.GetPartition(mount_point)
+
+        # File system not in this will not be able to be formatted, e.g., vfat
+        if partition.fs_type not in common.PARTITION_TYPES.keys():
+            print >>sys.stderr, "WARNING: Unknown FS type:", partition.fs_type, \
+                  "for", mount_point, "will continue without flashing this partition"
+            return
+
+        self.generator.Print("Flashing partition " + mount_point)
+
+        params = {
+            'device': partition.device,
+            'image_file': file
+        }
+
+        self.generator.WriteRawImage(mount_point, file)
 
     def import_releasetools(self):
         releasetools_dir = os.path.join(b2g_dir, "build", "tools", "releasetools")
@@ -842,41 +1190,169 @@ class FlashFotaBuilder(object):
         sys.path.pop()
 
     def zip_filter(self, path, relpath):
-        Item.Get(relpath, dir=os.path.isdir(path))
+        if self.fota_type == 'partial':
+            if not relpath in self.fota_files:
+                return False
+        self.GetItemOrItemset().Get(relpath, dir=os.path.isdir(path))
         if not os.path.isdir(path) and os.path.islink(path):
             # This assumes that system always maps to /system, data to /data, etc
             self.symlinks.append((os.readlink(path), "/" + relpath))
             return False
         return True
 
-    def build_flash_fota(self, system_dir, public_key, private_key, output_zip):
+    def build_flash_fota(self, system_dir, public_key, private_key, output_zip, update_bin):
         fd, unsigned_zip = tempfile.mkstemp()
         os.close(fd)
 
+        def custom_filter(target, files):
+          return map(lambda x: os.path.basename(x.split(':')[0]), filter(lambda x: x.find(target) > 0, files))
+
+        self.out_b2g_dir = os.path.join(self.system_dir, "b2g")
+        self.out_root = os.path.dirname(self.system_dir)
+        files = self.GetFilesType(self.out_b2g_dir)
+        self.b2g_libs = custom_filter('x-sharedlib', files)
+        self.b2g_exec = custom_filter('x-executable', files)
+
         with FotaZip(unsigned_zip, "w") as flash_zip:
-            flash_zip.write_recursive(system_dir, "system", filter=self.zip_filter)
+            if not self.fota_type == "fullimg":
+                flash_zip.write_recursive(system_dir, "system", filter=self.zip_filter)
             flash_zip.write_updater_script(self.build_flash_script())
-            flash_zip.write_default_update_binary()
+            flash_zip.write_default_update_binary(update_bin)
+            for p in self.fota_partitions:
+              try:
+                [ part, file ] = p.split(":")
+                target_image = os.path.join(self.out_root, file)
+                orig_image   = os.path.join(self.out_root, file)
+                p = self.GetPartition(part)
+                # Expand sparse image
+                if p.fs_type == "ext4":
+                    target_image += ".nosparse"
+                    run_command(["simg2img", orig_image, target_image])
+                flash_zip.write(target_image, file)
+                # Delete expanded image
+                if p.fs_type == "ext4":
+                    os.unlink(target_image)
+              except ValueError as e:
+                pass
 
         FotaZipBuilder().sign_zip(unsigned_zip, public_key, private_key,
                                   output_zip)
         os.unlink(unsigned_zip)
 
     def build_flash_script(self):
-        for mount_point, partition in self.fstab.iteritems():
-            partition_type = common.PARTITION_TYPES[partition.fs_type]
-            self.generator.AppendExtra('format("%s", "%s", "%s", %d);' % \
-                (partition.fs_type, partition_type, partition.device,
-                 partition.fs_size))
+        if not hasattr(self.generator, 'DeleteFilesRecursive'):
+            # This if block is for backwards compatibility since
+            # mozilla-b2g/B2G is not tracked in sources.xml.
+            # TODO: Remove after bug 1048854 has been fixed.
+            def deprecated_DeleteFilesRecursive(objects):
+                for o in objects:
+                    cmd = ('delete_recursive("%s");' % (o))
+                    self.generator.script.append(self.generator._WordWrap(cmd))
+            self.generator.DeleteFilesRecursive = deprecated_DeleteFilesRecursive
 
-        for mount_point in self.fstab:
-            self.generator.Mount(mount_point)
+        self.generator.Print("Starting B2G FOTA: " + self.fota_type)
 
-        self.generator.UnpackPackageDir("system", "/system")
+        cmd = ('show_progress(1.0, 0);')
+        self.generator.script.append(self.generator._WordWrap(cmd))
 
-        self.generator.MakeSymlinks(self.symlinks)
-        self.build_permissions()
+        cmd = ('set_progress(0.25);')
+        self.generator.script.append(self.generator._WordWrap(cmd))
+
+        # We need /system for reading props from build.prop
+        self.AssertMountIfNeeded("/system")
+
+        # We do not want to check the device/model when we are checking fingerprints.
+        if self.fota_check_device_name and not self.fota_check_fingerprints:
+            self.AssertDeviceOrModel(self.fota_check_device_name)
+        else:
+            if self.fota_check_fingerprints:
+                self.AssertFingerprints()
+
+        # We do not need that anymore for now, let's unmount
+        self.Umount("/system")
+
+        # This method is responsible for checking the partitions we want to format
+        self.FormatAll()
+
+        # Let's handle partial/full when we extract directories/files
+        if not self.fota_type == 'fullimg':
+            # We need /system for unpacking the update, and /data to cleanup stale update
+            self.AssertMountIfNeeded("/system")
+
+            if self.fota_type == 'partial':
+                # Checking fingerprint is for cases where we cannot
+                # rely on checking sha1 of libs
+                if self.fota_check_gonk_version and not self.fota_check_fingerprints:
+                    self.AssertGonkVersion()
+
+                self.AssertSystemHasRwAccess()
+
+                for f in self.fota_files:
+                    self.generator.Print("Removing " + f)
+                    self.generator.DeleteFiles(["/"+f])
+
+                for d in self.fota_dirs:
+                    self.generator.Print("Cleaning " + d)
+                    self.generator.DeleteFilesRecursive(["/"+d])
+
+                cmd = ('if greater_than_int(run_program("/system/bin/mv", "/system/b2g.bak", "/system/b2g"), 0) then')
+                self.generator.script.append(self.generator._WordWrap(cmd))
+                self.generator.Print("No previous stale update.")
+
+            cmd = ('set_progress(0.5);')
+            self.generator.script.append(self.generator._WordWrap(cmd))
+
+            self.generator.Print("Remove stale libdmd.so")
+            self.generator.DeleteFiles(["/system/b2g/libdmd.so"])
+
+            self.generator.Print("Remove stale update")
+            self.generator.DeleteFilesRecursive(["/system/b2g/updated"])
+
+            self.generator.Print("Extracting files to /system")
+            self.generator.UnpackPackageDir("system", "/system")
+
+            cmd = ('set_progress(0.65);')
+            self.generator.script.append(self.generator._WordWrap(cmd))
+
+            self.generator.Print("Creating symlinks")
+            self.generator.MakeSymlinks(self.symlinks)
+
+            self.generator.Print("Setting file permissions")
+            self.build_permissions()
+
+            cmd = ('set_progress(0.7);')
+            self.generator.script.append(self.generator._WordWrap(cmd))
+            self.generator.Print("Cleaning update files")
+            self.CleanUpdateFiles()
+
+            if self.fota_type == 'partial':
+                cmd = ('else ui_print("Restoring previous stale update."); endif;')
+                self.generator.script.append(self.generator._WordWrap(cmd))
+
+            cmd = ('set_progress(0.8);')
+            self.generator.script.append(self.generator._WordWrap(cmd))
+
+            self.generator.Print("Unmounting ...")
+            self.generator.UnmountAll()
+
+        for p in self.fota_partitions:
+            try:
+                [ part, file ] = p.split(":")
+                self.FlashPartition(part, file)
+            except ValueError as e:
+                pass
+
+        cmd = ('set_progress(0.9);')
+        self.generator.script.append(self.generator._WordWrap(cmd))
+        self.generator.Print("Cleaning device-specific files")
+        self.CleanDeviceFiles()
+
+        self.generator.Print("Unmounting ...")
         self.generator.UnmountAll()
+
+        cmd = ('set_progress(1.0);')
+        self.generator.script.append(self.generator._WordWrap(cmd))
+
         return "\n".join(self.generator.script) + "\n"
 
     def build_permissions(self):
@@ -889,17 +1365,30 @@ class FlashFotaBuilder(object):
         fs_config = Tool(os.path.join(host_bin_dir, "fs_config"))
         suffix = { False: "", True: "/" }
         paths = "\n".join([i.name + suffix[i.dir]
-                           for i in Item.ITEMS.itervalues() if i.name])
+                           for i in self.GetItemOrItemset().ITEMS.itervalues() if i.name]) + '\n'
         self.fs_config_data = fs_config.run(input=paths)
 
         # see build/tools/releasetools/ota_from_target_files
-        Item.GetMetadata(self)
-        Item.Get("system").SetPermissions(self.generator)
+        self.GetItemOrItemset().GetMetadata(self)
+        if not self.fota_type == 'partial':
+            self.GetItemOrItemset().Get("system").SetPermissions(self.generator)
+        else:
+            for f in self.fota_files:
+                self.GetItemOrItemset().Get(f).SetPermissions(self.generator)
+
+            for d in self.fota_dirs:
+                self.GetItemOrItemset().Get(d).SetPermissions(self.generator)
 
     "Emulate zipfile.read so we can reuse Item.GetMetadata"
     def read(self, path):
         if path == "META/filesystem_config.txt":
             return self.fs_config_data
         raise KeyError
+
+    def GetItemOrItemset(self):
+        if self.sdk_version >= 21:
+            return self.itemset
+        else:
+            return Item
 
 b2g_config = B2GConfig()

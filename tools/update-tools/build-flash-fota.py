@@ -30,14 +30,30 @@ def build_flash_fota(args):
     private_key = args.private_key or os.path.join(security_dir,
         args.dev_key + ".pk8")
     output_zip = args.output or "flash.zip"
+    update_bin = args.update_bin or os.path.join(update_tools.b2g_dir, "tools",
+        "update-tools", "bin", "gonk", "update-binary")
 
-    system = update_tools.Partition.create_system(args.system_fs_type,
-                                                  args.system_location)
-    data = update_tools.Partition.create_data(args.data_fs_type,
-                                              args.data_location)
-    builder = update_tools.FlashFotaBuilder(system, data)
+    builder = update_tools.FlashFotaBuilder(fstab=args.system_fstab,
+                                            sdk=args.sdk_version)
+
+    builder.fota_type = args.fota_type
+    builder.fota_dirs = []
+    builder.fota_files = []
+    if args.fota_type == 'partial':
+	builder.fota_dirs = args.fota_dirs.split(' ')
+        builder.fota_files = [line.rstrip() for line in open(args.fota_files, 'r')]
+
+    builder.fota_sdcard = args.fota_sdcard or "/sdcard"
+
+    builder.fota_check_device_name = args.fota_check_device_name
+    builder.fota_check_gonk_version = args.fota_check_gonk_version
+    builder.system_dir = args.system_dir
+
+    builder.fota_partitions = args.fota_partitions.split(' ') or []
+    builder.fota_format_partitions = args.fota_format_partitions.split(' ') or []
+
     builder.build_flash_fota(args.system_dir, public_key, private_key,
-                             output_zip)
+                             output_zip, update_bin)
     print "FOTA Flash ZIP generated: %s" % output_zip
 
 def main():
@@ -47,16 +63,36 @@ def main():
     system_group = parser.add_argument_group("system options")
     system_group.add_argument("--system-dir", dest="system_dir",
         required=True, help="path to system directory. required")
-    system_group.add_argument("--system-fs-type", dest="system_fs_type",
-        default=None, required=True, help="filesystem type for /system. required")
-    system_group.add_argument("--system-location", dest="system_location",
-        default=None, required=True, help="device location for /system. required")
+    system_group.add_argument("--system-fstab", dest="system_fstab",
+        default=None, required=True, help="path to the recovery fstab. required")
 
-    data_group = parser.add_argument_group("data options")
-    data_group.add_argument("--data-fs-type", dest="data_fs_type",
-        default=None, required=True, help="filesystem type for /data. required")
-    data_group.add_argument("--data-location", dest="data_location",
-        default=None, required=True, help="device location for /data. required")
+    fota_group = parser.add_argument_group("fota options")
+    fota_group.add_argument("--fota-type", dest="fota_type",
+        required=False, default="full",
+        help="'partial', 'full' or 'fullimg' fota. 'partial' requires a file list")
+    fota_group.add_argument("--fota-dirs", dest="fota_dirs",
+        required=False, default="",
+        help="space-separated string containing list of dirs to include, to delete files")
+    fota_group.add_argument("--fota-files", dest="fota_files",
+        required=False, default="",
+        help="file containing list of files in /system to include")
+    fota_group.add_argument("--fota-sdcard", dest="fota_sdcard",
+        required=False, default="/sdcard",
+        help="sdcard mountpoint in recovery mode (RECOVERY_EXTERNAL_STORAGE)")
+    fota_group.add_argument("--fota-partitions", dest="fota_partitions",
+        required=False, default="",
+        help="space-separated string containing list of partitions to flash")
+    fota_group.add_argument("--fota-format-partitions", dest="fota_format_partitions",
+        default="", required=False,
+        help="space-separated list of partitions mount point that we allow to format")
+
+    fota_checks_group = parser.add_argument_group("fota_checks_group")
+    fota_checks_group.add_argument("--fota-check-device-name", dest="fota_check_device_name",
+        default=None, required=False,
+        help="'add a check to prevent the update from being installed on a device different from TARGET_DEVICE")
+    fota_checks_group.add_argument("--fota-check-gonk-version", dest="fota_check_gonk_version",
+        default=False, required=False, action="store_true",
+        help="add checks to verify that the device's libraries match the ones the update depends on")
 
     signing_group = parser.add_argument_group("signing options")
     signing_group.add_argument("-d", "--dev-key", dest="dev_key",
@@ -71,6 +107,14 @@ def main():
     signing_group.add_argument("-K", "--public-key", dest="public_key",
         metavar="PUBLIC_KEY", default=None,
         help="Public key used for signing the update.zip. Overrides --dev-key.")
+
+    parser.add_argument("-u", "--update-bin", dest="update_bin",
+        required=False, default=None,
+        help="Specify update-binary to be used in update.zip.")
+
+    parser.add_argument("-s", "--sdk-version", dest="sdk_version",
+        required=False, default=15, type=int,
+        help="Specify the target SDK version (defaulting to SDK 15, ICS) when producing update.zip.")
 
     parser.add_argument("-o", "--output", dest="output", metavar="ZIP",
         help="Output to ZIP. Default: flash.zip", default=None)

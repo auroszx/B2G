@@ -6,6 +6,14 @@ ADB=adb
 PROFILE_DIR=/data/local/tmp
 PROFILE_PATTERN=${PROFILE_DIR}/'profile_?_*.txt';
 PREFIX=""
+BP_SYMBOLS=""
+
+if [ -n "$SPS_PROFILE_DEVICE" ]; then
+  ADB="adb -s ${SPS_PROFILE_DEVICE}"
+fi
+
+FEATURES_FLAG="MOZ_PROFILING_FEATURES"
+DEFAULT_FEATURES=js,leaf
 
 # The get_pids function populates B2G_PIDS as an array containting the PIDs
 # of all of the b2g processes
@@ -14,6 +22,27 @@ declare -a B2G_PIDS
 # The get_comms function populates B2G_COMMS as an array mapping
 # pids to comms (process names). get_comms also causes B2G_PIDS to be populated.
 declare -a B2G_COMMS
+
+# This function takes a variable that is either a pid or a process name
+# and returns the pid or exits on error
+get_pid_by_pid_or_name() {
+    pid="$1"
+    case $pid in
+      *[^0-9]*)
+        pid=$(get_pid_by_name "$pid")
+        if [ -z "$pid" ] ; then
+          echo Error: PID $1 is invalid
+          exit 1;
+        fi
+      ;;
+    esac
+    echo -n "$pid"
+    return
+}
+
+get_pid_by_name() {
+    echo $($ADB shell "toolbox ps '$1' | (read header; read user pid rest; echo -n \$pid)")
+}
 
 ###########################################################################
 #
@@ -58,7 +87,7 @@ get_pids() {
     return
   fi
 
-  B2G_PIDS=($(${ADB} shell ps | while read line; do
+  B2G_PIDS=($(${ADB} shell toolbox ps | while read line; do
     if [ "${line/*b2g*/b2g}" = "b2g" ]; then
       echo ${line} | (
         read user pid rest;
@@ -96,11 +125,106 @@ is_profiler_running() {
   if [ -z "${pid}" ]; then
     return 1
   fi
-  local status="$(${ADB} shell cat /proc/${pid}/environ | tr '\0' '\n' | grep 'MOZ_PROFILER_STARTUP=1')"
+  local status="$(${ADB} shell cat "/proc/${pid}/task/*/stat" | tr '\0' '\n' | grep '(SamplerThread)')"
   if [ -z "${status}" ]; then
     return 1
   fi
   return 0
+}
+
+###########################################################################
+#
+# Parses start arguments array and sets their features
+#
+start_with_args() {
+  fileName="/data/local/tmp/profiler.options"
+  B2G_PID=""
+  ${ADB} shell rm $fileName &> /dev/null
+  features=""
+  threads=""
+  tasktracer=""
+
+  while getopts "i:m:t:f:p:e:s:" opt "$@"; do
+    case $opt in
+      e)
+        echo "Entries: $OPTARG"
+        ${ADB} shell "echo MOZ_PROFILER_ENTRIES=$OPTARG >> $fileName"
+        ;;
+      s)
+        echo "Stack Scan: $OPTARG"
+        ${ADB} shell "echo MOZ_PROFILER_STACK_SCAN=$OPTARG >> $fileName"
+        ;;
+      i)
+        echo "Interval: $OPTARG"
+        ${ADB} shell "echo MOZ_PROFILER_INTERVAL=$OPTARG >> $fileName"
+        ;;
+      m)
+        echo "Mode: $OPTARG"
+        ${ADB} shell "echo MOZ_PROFILER_MODE=$OPTARG >> $fileName"
+        ;;
+      t)
+        threads=$OPTARG
+        echo "Threads: $OPTARG"
+        ${ADB} shell "echo threads=$threads >> $fileName"
+        ;;
+      f)
+        features=$OPTARG
+        echo "Features: $features"
+        ${ADB} shell "echo $FEATURES_FLAG=$features>> $fileName"
+        ;;
+      p)
+        echo "Process: $OPTARG"
+        B2G_PID=$(get_pid_by_pid_or_name "$OPTARG") || {
+          echo "Could not find pid: $OPTARG"
+          exit 1
+        }
+        ;;
+      ?)
+        exit 1
+        ;;
+      esac
+  done
+
+  # Feature / thread fix up. If we have a thread
+  # the feature "threads" must be enabled
+  if [ -z "$features" ]
+  then
+    if [ -n "$threads" ]
+    then
+      echo "Using default features js,leaf,threads"
+      ${ADB} shell "echo $FEATURES_FLAG=$DEFAULT_FEATURES,threads >> $fileName"
+    else
+      echo "Using default features $DEFAULT_FEATURES"
+      ${ADB} shell "echo $FEATURES_FLAG=$DEFAULT_FEATURES >> $fileName"
+    fi
+  fi
+
+  if [ -n "`echo $features | grep tasktracer`" ]
+  then
+    tasktracer="true"
+    clear_pids
+    get_pids
+    echo "Enable feature TaskTracer requires profiling on all current running processes."
+    for pid in ${B2G_PIDS[*]}; do
+      echo "Starting profiling with TaskTracer on PID ${pid}"
+      ${ADB} shell "kill -12 ${pid}"
+    done
+    echo "Profiler started"
+  fi
+
+  if [ -z "$tasktracer" ]
+  then
+    if [ -z "$B2G_PID" ]
+    then
+      echo "No B2G process specified. Exiting"
+      exit 1
+    else
+      echo "Starting profiling PID $B2G_PID"
+      ${ADB} shell "kill -12 ${B2G_PID}"
+      echo "Profiler started"
+      echo
+    fi
+  fi
 }
 
 ###########################################################################
@@ -119,21 +243,81 @@ remove_profile_files() {
   echo " done"
 }
 
+
+###########################################################################
+#
+# Make sure that the basic requirements for a video capture profiles
+# are met.
+#
+check_video_capture_requirements() {
+  if ! hash avconv 2> /dev/null; then
+    echo "avconv not found, please install it."
+    exit 1
+  fi
+  if [ -z "$SPS_VIDEO_DEVICE" ]; then
+    echo "You must have \$SPS_VIDEO_DEVICE set to an android device that can capture a video feed."
+    exit 1
+  fi
+  if [ -z "$SPS_VIDEO_SCP_DEST" ]; then
+    echo "You must have \$SPS_VIDEO_SCP_DEST set to a public_html folder."
+    exit 1
+  fi
+  if [ -z "$SPS_VIDEO_LINK" ]; then
+    echo "You must have \$SPS_VIDEO_LINK to the HTTP prefix for \$SPS_VIDEO_SCP_DEST."
+    exit 1
+  fi
+}
+
 ###########################################################################
 #
 # Capture the profiling information from a given process.
 #
 HELP_capture="Signals, pulls, and symbolicates the profile data"
 cmd_capture() {
-  # Send the signal right away. If the profiler wasn't started we'll catch
-  # that later.
-  cmd_signal "$1"
-  # Verify that b2g was started with the profiler enabled
-  if ! is_profiler_running $(get_b2g_pid); then
-    echo "Profiler doesn't seem to be running"
-    echo "Did you start the profiler using ${SCRIPT_NAME} start ?"
-    exit 1
+  video=0
+
+  while getopts "s:v" opt "$@"; do
+    case $opt in
+      s)
+        echo "Symbols: $OPTARG"
+        BP_SYMBOLS="-s $OPTARG"
+        ;;
+      v)
+        video=1
+        ;;
+      ?)
+        exit 1
+        ;;
+    esac
+  done
+
+  # Start recording with the camera
+  if [ "$video" -ne 0 ]; then
+    check_video_capture_requirements
+    adb -s "$SPS_VIDEO_DEVICE" shell "am start -a android.media.action.VIDEO_CAPTURE"
+    if [ $? != 0 ]; then
+      exit 1
+    fi
+
+    FILES_BEFORE="$(adb -s "$SPS_VIDEO_DEVICE" shell ls "/sdcard/DCIM/Camera/*.mp4" | tr '\r' ' ')"
+
+    echo "Point the camera so that the QR code is visible at all times."
+    echo "If you do not see th QR code then set layers.frame-counter;true and retry."
+    echo ""
+    echo "Hit ENTER when ready to start recording"
+    read anykey
+
+    adb -s "$SPS_VIDEO_DEVICE" shell "input keyevent KEYCODE_CAMERA"
+
+    echo "Recording in progress."
+    echo ""
+    echo "Hit ENTER when ready to stop capture"
+    read anykey
   fi
+
+  # Send the signal right away. If the profiler wasn't started, this will
+  # print an error message and exit.
+  cmd_signal
   get_comms
   declare -a local_filename
   local timestamp=$(date +"%H%M")
@@ -166,17 +350,61 @@ cmd_capture() {
     wait
     echo "Done"
   else
-    pid="${CMD_SIGNAL_PID}"
-    echo "Stabilizing ${pid} ${B2G_COMMS[${pid}]} ..." 1>&2
-    stabilized=$(cmd_stabilize ${pid})
-    if [ "${stabilized}" == "0" ]; then
-      echo "Process ${pid} was probably killed due to OOM" 1>&2
-    else
-      cmd_pull ${pid} "${B2G_COMMS[${pid}]}"
-      if [ ! -z "${CMD_PULL_LOCAL_FILENAME}" -a -s "${CMD_PULL_LOCAL_FILENAME}" ]; then
-        cmd_symbolicate "${CMD_PULL_LOCAL_FILENAME}"
+
+    # Pull the nwest video files
+    if [ "$1" == "-video" ]; then
+      adb -s "$SPS_VIDEO_DEVICE" shell "input keyevent KEYCODE_CAMERA"
+      sleep 2 # Wait for the video to save
+      FILES_AFTER=$(adb -s "$SPS_VIDEO_DEVICE" shell ls "/sdcard/DCIM/Camera/*.mp4" | tr '\r' ' ')
+      for i in ${FILES_AFTER}; do
+        unset found
+        for j in ${FILES_BEFORE}; do
+          if [ "$i" == "$j" ]; then
+            found=true
+          fi
+        done
+        if [ -z "$found" ]; then
+          SPS_VIDEO_FILE="$i"
+        fi
+      done
+      if [ -z "$SPS_VIDEO_FILE" ]; then
+        echo "Failed to get video capture"
+        exit 1
       fi
+      VIDEO_FILE=video_capture_$(date +"%s").webm
+      adb -s "$SPS_VIDEO_DEVICE" pull "$SPS_VIDEO_FILE" video_capture.mp4
+      # Transcode video while stripping audio. When mp4 is supported everywhere this step should only strip the audio
+      avconv -y -i video_capture.mp4 -an -c:v libvpx -minrate 1M -maxrate 8M -b:v 8M video_capture.mp4.webm "$VIDEO_FILE"
+      echo "Uploading video, you may be prompted for your ssh passphrase"
+      scp -p "$VIDEO_FILE" "$SPS_VIDEO_SCP_DEST"/"$VIDEO_FILE"
     fi
+
+    pids="${CMD_SIGNAL_PID}"
+    profiles_count=0
+    profiles_to_merge=""
+    for pid in $pids; do
+      echo "Stabilizing ${pid} ${B2G_COMMS[${pid}]} ..." 1>&2
+      stabilized=$(cmd_stabilize ${pid})
+      if [ "${stabilized}" == "0" ]; then
+        echo "Process ${pid} was probably killed due to OOM" 1>&2
+      else
+        cmd_pull ${pid} "${B2G_COMMS[${pid}]}"
+        if [ ! -z "${CMD_PULL_LOCAL_FILENAME}" -a -s "${CMD_PULL_LOCAL_FILENAME}" ]; then
+          cmd_symbolicate "${CMD_PULL_LOCAL_FILENAME}"
+          profiles_to_merge="$profiles_to_merge $CMD_SYMBOLICATE_PROFILE"
+          let profiles_count=profiles_count+1
+        fi
+      fi
+    done
+    SPS_VIDEO_ARGS=
+    if [ -n "$SPS_VIDEO_FILE" ]; then
+      SPS_VIDEO_ARGS="--video=$SPS_VIDEO_LINK/$VIDEO_FILE"
+    fi
+    echo "Merging profile: $profiles_to_merge"
+    echo ./gecko/tools/profiler/merge-profiles.py ${SPS_VIDEO_ARGS} $profiles_to_merge
+    ./gecko/tools/profiler/merge-profiles.py ${SPS_VIDEO_ARGS} $profiles_to_merge > profile_captured.sym
+    echo ""
+    echo "Results: profile_captured.sym"
   fi
   # cmd_pull should remove each file as we pull it. This just covers the
   # case where it doesn't
@@ -246,6 +474,11 @@ cmd_pull() {
   local comm=$2
   local label=$3
 
+  pid=$(get_pid_by_pid_or_name "$pid") || {
+    echo "Could not find pid: $1"
+    exit 1;
+  }
+
   # The profile data gets written to /data/local/tmp/profile_X_PID.txt
   # where X is the XRE_ProcessType (so 0 for the b2g process, 2 for
   # the plugin containers).
@@ -257,15 +490,18 @@ cmd_pull() {
   local profile_filename
   local profile_pattern="${PROFILE_DIR}/profile_?_${pid}.txt"
   local local_filename
+  # Remove all non-alphanumeric characters from the process name to
+  # make filename-handling sane.
+  local alphanum_process_name=${B2G_COMMS[${pid}]//[^A-Za-z0-9]/}
   if [ -z "${comm}" ]; then
     local_filename="profile_${pid}.txt"
   elif [ -z "${label}" ]; then
-    local_filename="profile_${pid}_${B2G_COMMS[${pid}]}.txt"
+    local_filename="profile_${pid}_${alphanum_process_name}.txt"
   else
-    local_filename="profile_${label}_${pid}_${B2G_COMMS[${pid}]}.txt"
+    local_filename="profile_${label}_${pid}_${alphanum_process_name}.txt"
   fi
   profile_filename=$(${ADB} shell "echo -n ${profile_pattern}")
-  
+
   CMD_PULL_LOCAL_FILENAME=
   if [ "${profile_filename}" == "${profile_pattern}" ]; then
     echo "${PREFIX}Profile file for PID ${pid} ${B2G_COMMS[${pid}]} doesn't exist - process likely killed due to OOM"
@@ -295,11 +531,19 @@ cmd_signal() {
   # then find_pid will see the results of us calling get_comms.
   get_comms
   local pid
+  local curr_pid
   if [ -z "$1" ]; then
-    # If no pid is specified, then send a signal to the b2g process group.
-    # This will cause the signal to go to b2g and all of it subprocesses.
-    pid=-$(find_pid b2g)
-    echo "Signalling Process Group: ${pid:1} ${B2G_COMMS[${pid:1}]} ..."
+    for curr_pid in ${B2G_PIDS[*]}; do
+      if is_profiler_running ${curr_pid}; then
+        pid="${pid} ${curr_pid}"
+      fi
+    done
+    if [ -z "$pid" ]; then
+      echo "Not profiling any processes to signal"
+      echo "Did you start the profiler using ${SCRIPT_NAME} start ?"
+      exit 1
+    fi
+    echo "Signaling Profiled Processes:${pid}"
   else
     pid=$(find_pid "$1")
     if [ "${pid}" == "" ]; then
@@ -348,14 +592,14 @@ cmd_stabilize() {
   local waiting=0
 
   while true; do
-    curr_sizes=$(${ADB} shell ls -l ${PROFILE_DIR}/'profile_?_*.txt' |
+    curr_sizes=$(${ADB} shell toolbox ls -l ${PROFILE_DIR}/'profile_?_*.txt' |
       while read line; do
         echo ${line} | (
           read perms user group size rest;
           echo -n "${size} "
         )
       done)
-    curr_size=$(${ADB} shell ls -l ${PROFILE_DIR}/'profile_?_'${pid}'.txt' | (read perms user group size rest; echo -n ${size}))
+    curr_size=$(${ADB} shell toolbox ls -l ${PROFILE_DIR}/'profile_?_'${pid}'.txt' | (read perms user group size rest; echo -n ${size}))
     if [ "${curr_size}" == "0" ]; then
       # Our file hasn't changed. See if others have
       if [ "${curr_sizes}" == "${prev_sizes}" ]; then
@@ -394,15 +638,23 @@ cmd_stabilize() {
 #
 # Start b2g with the profiler enabled.
 #
-HELP_start="Starts the profiler"
+HELP_start="Starts the profiler. -p [process] -e [entries] -s [stack scan mode]
+              -i [interval] -m [profiler mode] -f [features] -t [threads].
+              e.g. ./profile.sh start -p b2g -t Compositor -i 1"
 cmd_start() {
-  stop_b2g
-  remove_profile_files
-  echo -n "Starting b2g with profiling enabled ..."
-  # Use nohup or we may accidentally kill the adb shell when this
-  # script exits.
-  nohup ${ADB} shell "MOZ_PROFILER_STARTUP=1 /system/bin/b2g.sh > /dev/null" > /dev/null 2>&1 &
-  echo " started"
+  if [ $# -gt 0 ]
+  then
+    start_with_args "$@"
+  else
+    stop_b2g
+    remove_profile_files
+    default_flags=" MOZ_PROFILER_STARTUP=1 $FEATURES_FLAG=$DEFAULT_FEATURES"
+
+    echo -n "Starting b2g with profiling enable and default flags: $default_flags"
+    echo
+    nohup ${ADB} shell "$default_flags /system/bin/b2g.sh > /dev/null" > /dev/null 2>&1 &
+    echo "Started"
+  fi
 }
 
 ###########################################################################
@@ -435,16 +687,19 @@ cmd_symbolicate() {
 
   # Get some variables from the build system
   local var_profile="./.var.profile"
-  if [ ! -f ${var_profile} ]; then
+  if [ -f ${var_profile} ]; then
+      source ${var_profile}
+  elif [ -z "$BP_SYMBOLS" ]; then
     echo "${PREFIX}Unable to locate ${var_profile}"
     echo "${PREFIX}You need to build b2g in order to get symbolic information"
     exit 1
   fi
-  source ${var_profile}
 
   local sym_filename="${profile_filename%.*}.sym"
   echo "${PREFIX}Adding symbols to ${profile_filename} and creating ${sym_filename} ..."
-  ./scripts/profile-symbolicate.py -o "${sym_filename}" "${profile_filename}" > /dev/null
+  ./scripts/profile-symbolicate.py \
+    $BP_SYMBOLS -o "${sym_filename}" "${profile_filename}" > /dev/null
+  CMD_SYMBOLICATE_PROFILE="$sym_filename"
 }
 
 ###########################################################################
